@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+cdk.out/
+*.tsbuildinfo
+
+# test output
+coverage/
+junit.xml
+
+# local configuration — never commit credentials
+.env
+.env.*
+!.env.example
+
+# logs and editor files
+*.log
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,40 @@
+{
+  "name": "aws-cost-anomaly-telegram",
+  "version": "1.0.0",
+  "description": "AWS cost & anomaly alerts delivered to Telegram, built with AWS CDK v2 and TypeScript.",
+  "author": "Daniel Won (https://github.com/th3won)",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cost-explorer": "^3.1176.0",
+    "@aws-sdk/client-dynamodb": "^3.1176.0",
+    "@aws-sdk/lib-dynamodb": "^3.1176.0",
+    "aws-cdk-lib": "^2.278.0",
+    "constructs": "^10.8.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.164",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^20.19.43",
+    "aws-cdk": "^2.1149.0",
+    "dotenv": "^18.0.10",
+    "esbuild": "^0.28.2",
+    "jest": "^29.7.0",
+    "source-map-support": "^0.5.21",
+    "ts-jest": "^29.4.15",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
