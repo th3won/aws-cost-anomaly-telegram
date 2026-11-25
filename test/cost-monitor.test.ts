@@ -1,14 +1,30 @@
 import { CostExplorerClient, GetCostAndUsageCommand } from '@aws-sdk/client-cost-explorer';
+import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import type { Context } from 'aws-lambda';
 
-import { handler } from '../lambda/cost-monitor';
+import { createHandler } from '../lambda/cost-monitor';
+import { DEFAULT_TOKEN_CACHE_TTL_MS, SsmBotTokenProvider } from '../lambda/lib/bot-token';
 
+const TOKEN_PARAM = '/aws-cost-anomaly-telegram/telegram-bot-token';
 const context = { awsRequestId: 'request-1' } as Context;
+
+const anomalyEvent = {
+  source: 'aws.ce',
+  'detail-type': 'Anomaly Detected',
+  detail: {
+    dimensionValue: 'Amazon Elastic Compute Cloud - Compute',
+    impact: { totalImpact: 1001, totalActualSpend: 1301, totalExpectedSpend: 300 },
+  },
+};
 
 let costExplorerSend: jest.SpyInstance;
 let documentClientSend: jest.SpyInstance;
+let ssmSend: jest.SpyInstance;
 let fetchMock: jest.Mock;
+let handler: ReturnType<typeof createHandler>;
+let tokenProvider: SsmBotTokenProvider;
+let clock: number;
 
 function costResponse(total: string, groups: Record<string, string> = {}) {
   return {
@@ -24,22 +40,39 @@ function costResponse(total: string, groups: Record<string, string> = {}) {
   };
 }
 
-function sentMessage(): Record<string, unknown> {
+function sentMessage(index = 0): Record<string, unknown> {
   expect(fetchMock).toHaveBeenCalled();
-  const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+  const [, init] = fetchMock.mock.calls[index] as [string, RequestInit];
   return JSON.parse(String(init.body)) as Record<string, unknown>;
+}
+
+function telegramUrl(index = 0): string {
+  return String((fetchMock.mock.calls[index] as [string])[0]);
 }
 
 beforeEach(() => {
   process.env.SNAPSHOT_TABLE_NAME = 'cost-snapshots';
-  process.env.TELEGRAM_BOT_TOKEN = 'token-for-tests';
+  process.env.TELEGRAM_BOT_TOKEN_PARAM_NAME = TOKEN_PARAM;
   process.env.TELEGRAM_CHAT_ID = '987654321';
   process.env.DAILY_THRESHOLD_USD = '50';
   process.env.SPEND_CHANGE_THRESHOLD_PERCENT = '30';
   process.env.TIME_ZONE = 'Asia/Seoul';
 
+  clock = 1_700_000_000_000;
+
   costExplorerSend = jest.spyOn(CostExplorerClient.prototype, 'send');
   documentClientSend = jest.spyOn(DynamoDBDocumentClient.prototype, 'send');
+  ssmSend = jest
+    .spyOn(SSMClient.prototype, 'send')
+    .mockResolvedValue({ Parameter: { Name: TOKEN_PARAM, Value: 'token-for-tests' } } as never);
+
+  tokenProvider = new SsmBotTokenProvider({
+    parameterName: TOKEN_PARAM,
+    ttlMs: DEFAULT_TOKEN_CACHE_TTL_MS,
+    now: () => clock,
+  });
+  handler = createHandler({ botTokenSourceFactory: () => tokenProvider });
+
   fetchMock = jest.fn().mockResolvedValue({
     ok: true,
     status: 200,
@@ -52,25 +85,97 @@ beforeEach(() => {
 afterEach(() => {
   jest.restoreAllMocks();
   for (const key of Object.keys(process.env)) {
-    if (key.startsWith('TELEGRAM_') || key.startsWith('SNAPSHOT_') || key.startsWith('DAILY_') || key.startsWith('SPEND_') || key === 'TIME_ZONE') {
+    if (
+      key.startsWith('TELEGRAM_') ||
+      key.startsWith('SNAPSHOT_') ||
+      key.startsWith('DAILY_') ||
+      key.startsWith('SPEND_') ||
+      key === 'TIME_ZONE'
+    ) {
       delete process.env[key];
     }
   }
 });
 
+describe('handler — bot token lookup', () => {
+  test('reads the token from SSM with decryption and uses it in the Telegram URL', async () => {
+    costExplorerSend.mockResolvedValue(costResponse('12.35', { 'AWS Lambda': '12.35' }));
+    documentClientSend.mockImplementation(async () => ({}));
+
+    await handler({ mode: 'daily' }, context);
+
+    expect(ssmSend).toHaveBeenCalledTimes(1);
+    const command = ssmSend.mock.calls[0][0] as GetParameterCommand;
+    expect(command.input).toEqual({ Name: TOKEN_PARAM, WithDecryption: true });
+    expect(telegramUrl()).toContain('/bottoken-for-tests/sendMessage');
+  });
+
+  test('reuses the cached token on a warm invocation instead of calling SSM again', async () => {
+    await handler(anomalyEvent, context);
+    await handler(anomalyEvent, context);
+
+    expect(ssmSend).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('reads the rotated token again once the cache TTL has passed', async () => {
+    ssmSend
+      .mockResolvedValueOnce({ Parameter: { Value: 'token-before-rotation' } } as never)
+      .mockResolvedValueOnce({ Parameter: { Value: 'token-after-rotation' } } as never);
+
+    await handler(anomalyEvent, context);
+    expect(telegramUrl(0)).toContain('/bottoken-before-rotation/sendMessage');
+
+    // Exactly at the TTL boundary the cached value is expired by design.
+    clock += DEFAULT_TOKEN_CACHE_TTL_MS;
+    await handler(anomalyEvent, context);
+
+    expect(ssmSend).toHaveBeenCalledTimes(2);
+    expect(telegramUrl(1)).toContain('/bottoken-after-rotation/sendMessage');
+  });
+
+  test('fails with a clear message when the parameter does not exist', async () => {
+    const notFound = Object.assign(new Error('Parameter not found.'), {
+      name: 'ParameterNotFound',
+    });
+    ssmSend.mockRejectedValue(notFound);
+
+    await expect(handler(anomalyEvent, context)).rejects.toThrow(
+      new RegExp(`SSM parameter ${TOKEN_PARAM} was not found`),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('fails when the parameter exists but holds an empty value', async () => {
+    ssmSend.mockResolvedValue({ Parameter: { Value: '' } } as never);
+
+    await expect(handler(anomalyEvent, context)).rejects.toThrow(/is empty/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('does not cache a failed lookup', async () => {
+    ssmSend
+      .mockRejectedValueOnce(Object.assign(new Error('denied'), { name: 'AccessDeniedException' }))
+      .mockResolvedValueOnce({ Parameter: { Value: 'token-for-tests' } } as never);
+
+    await expect(handler(anomalyEvent, context)).rejects.toThrow(/Access denied/);
+    await handler(anomalyEvent, context);
+
+    expect(ssmSend).toHaveBeenCalledTimes(2);
+    expect(telegramUrl(0)).toContain('/bottoken-for-tests/sendMessage');
+  });
+});
+
 describe('handler — daily summary', () => {
   test('stores the snapshot, then sends the summary to Telegram', async () => {
     costExplorerSend.mockResolvedValue(costResponse('12.35', { 'AWS Lambda': '12.35' }));
-    documentClientSend.mockImplementation(async (command: unknown) =>
-      command instanceof GetCommand ? {} : {},
-    );
+    documentClientSend.mockImplementation(async () => ({}));
 
     const result = await handler({ mode: 'daily' }, context);
 
     expect(result).toMatchObject({ mode: 'daily', notified: true, alert: false, totalUsd: 12.35 });
     expect(documentClientSend).toHaveBeenCalledWith(expect.any(PutCommand));
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String((fetchMock.mock.calls[0] as [string])[0])).toContain('/bottoken-for-tests/sendMessage');
     expect(sentMessage()).toMatchObject({ chat_id: '987654321', parse_mode: 'HTML' });
     expect(String(sentMessage().text)).toContain('AWS daily cost summary');
   });
@@ -120,17 +225,7 @@ describe('handler — daily summary', () => {
 
 describe('handler — anomaly events', () => {
   test('relays an Anomaly Detected event without touching Cost Explorer', async () => {
-    const result = await handler(
-      {
-        source: 'aws.ce',
-        'detail-type': 'Anomaly Detected',
-        detail: {
-          dimensionValue: 'Amazon Elastic Compute Cloud - Compute',
-          impact: { totalImpact: 1001, totalActualSpend: 1301, totalExpectedSpend: 300 },
-        },
-      },
-      context,
-    );
+    const result = await handler(anomalyEvent, context);
 
     expect(result).toMatchObject({ mode: 'anomaly', notified: true, alert: true });
     expect(costExplorerSend).not.toHaveBeenCalled();
@@ -145,6 +240,14 @@ describe('handler — configuration', () => {
 
     await expect(handler({ mode: 'daily' }, context)).rejects.toThrow(
       'Missing required environment variable: TELEGRAM_CHAT_ID',
+    );
+  });
+
+  test('fails when the token parameter name is not configured', async () => {
+    delete process.env.TELEGRAM_BOT_TOKEN_PARAM_NAME;
+
+    await expect(handler({ mode: 'daily' }, context)).rejects.toThrow(
+      'Missing required environment variable: TELEGRAM_BOT_TOKEN_PARAM_NAME',
     );
   });
 });
