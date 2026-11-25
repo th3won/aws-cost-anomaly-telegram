@@ -13,18 +13,35 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import type { Construct } from 'constructs';
 
-/** Placeholder used when the deploy environment does not provide Telegram credentials. */
-export const PLACEHOLDER_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN';
+/**
+ * Default SSM Parameter Store parameter that holds the Telegram bot token as a
+ * SecureString. It is created outside the stack (`aws ssm put-parameter ...`),
+ * so the token never appears in the CloudFormation template or in the Lambda
+ * configuration.
+ */
+export const DEFAULT_TELEGRAM_BOT_TOKEN_PARAM_NAME =
+  '/aws-cost-anomaly-telegram/telegram-bot-token';
+
+/** Placeholder used when the deploy environment does not provide a chat id. */
 export const PLACEHOLDER_CHAT_ID = 'YOUR_TELEGRAM_CHAT_ID';
 
 export interface CostAnomalyStackProps extends StackProps {
-  /** Telegram bot token created with @BotFather. */
-  readonly telegramBotToken?: string;
+  /**
+   * Name of the SSM SecureString parameter holding the bot token.
+   * Defaults to {@link DEFAULT_TELEGRAM_BOT_TOKEN_PARAM_NAME}.
+   */
+  readonly telegramBotTokenParamName?: string;
+  /**
+   * Customer-managed KMS key that encrypts the SecureString parameter. When it
+   * is omitted the AWS managed key `alias/aws/ssm` is assumed.
+   */
+  readonly telegramBotTokenEncryptionKey?: kms.IKey;
   /** Telegram chat id that receives the alerts. */
   readonly telegramChatId?: string;
   /** Daily spend in USD at or above which the summary is flagged. Defaults to 50. */
@@ -38,28 +55,39 @@ export interface CostAnomalyStackProps extends StackProps {
  *
  *   EventBridge (daily 00:00 UTC) ─┐
  *   EventBridge (cost anomaly)     ─┴─▶ Lambda ─▶ Cost Explorer
+ *                                          ├───▶ SSM Parameter Store (bot token, SecureString)
  *                                          ├───▶ DynamoDB (daily snapshots)
  *                                          └───▶ Telegram Bot API
  */
 export class CostAnomalyStack extends Stack {
   public readonly monitorFunction: lambda.IFunction;
   public readonly snapshotTable: dynamodb.Table;
+  /** ARN of the SSM parameter the function is allowed to read. */
+  public readonly telegramBotTokenParameterArn: string;
 
   constructor(scope: Construct, id: string, props: CostAnomalyStackProps = {}) {
     super(scope, id, props);
 
     const functionName = 'cost-anomaly-monitor';
-    const telegramBotToken = props.telegramBotToken ?? PLACEHOLDER_BOT_TOKEN;
+    const botTokenParamName =
+      props.telegramBotTokenParamName ?? DEFAULT_TELEGRAM_BOT_TOKEN_PARAM_NAME;
     const telegramChatId = props.telegramChatId ?? PLACEHOLDER_CHAT_ID;
     const dailyThresholdUsd = props.dailyThresholdUsd ?? 50;
     const spendChangeThresholdPercent = props.spendChangeThresholdPercent ?? 30;
 
-    if (!props.telegramBotToken || !props.telegramChatId) {
+    if (!botTokenParamName.startsWith('/')) {
+      throw new Error(
+        `telegramBotTokenParamName must be a fully qualified SSM parameter name starting with "/", ` +
+          `got "${botTokenParamName}".`,
+      );
+    }
+
+    if (!props.telegramChatId) {
       Annotations.of(this).addWarningV2(
-        'TelegramCredentialsMissing',
-        'TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not set, so the stack will be deployed with ' +
-          'placeholder values and the notifier will not reach Telegram. Set them in the ' +
-          'environment or in .env before deploying.',
+        'TelegramChatIdMissing',
+        'TELEGRAM_CHAT_ID is not set, so the stack will be deployed with a placeholder value and ' +
+          'the notifier will not reach Telegram. Set it in the environment or in .env before ' +
+          `deploying, and store the bot token in the SSM SecureString parameter ${botTokenParamName}.`,
       );
     }
 
@@ -87,7 +115,8 @@ export class CostAnomalyStack extends Stack {
       timeout: Duration.seconds(60),
       logGroup,
       environment: {
-        TELEGRAM_BOT_TOKEN: telegramBotToken,
+        // Only the parameter name is deployed; the token itself stays in SSM.
+        TELEGRAM_BOT_TOKEN_PARAM_NAME: botTokenParamName,
         TELEGRAM_CHAT_ID: telegramChatId,
         SNAPSHOT_TABLE_NAME: this.snapshotTable.tableName,
         DAILY_THRESHOLD_USD: String(dailyThresholdUsd),
@@ -104,14 +133,53 @@ export class CostAnomalyStack extends Stack {
       },
     });
 
-    // Cost Explorer does not support resource-level permissions, so the statement is account wide.
+    // SEC03-BP01: the function calls GetCostAndUsage and nothing else. Cost
+    // Explorer has no resource-level permissions, so the resource stays '*'
+    // while the action set is narrowed to the one action the code uses.
     this.monitorFunction.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'CostExplorerQueryAccess',
-        actions: ['ce:*'],
+        actions: ['ce:GetCostAndUsage'],
         resources: ['*'],
       }),
     );
+
+    // SEC02-BP03: read exactly one SecureString parameter, nothing else.
+    this.telegramBotTokenParameterArn = this.formatArn({
+      service: 'ssm',
+      resource: 'parameter',
+      resourceName: botTokenParamName.replace(/^\//, ''),
+    });
+
+    this.monitorFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadTelegramBotTokenParameter',
+        actions: ['ssm:GetParameter'],
+        resources: [this.telegramBotTokenParameterArn],
+      }),
+    );
+
+    if (props.telegramBotTokenEncryptionKey) {
+      // A customer-managed key is known at synth time, so the grant can name it.
+      props.telegramBotTokenEncryptionKey.grantDecrypt(this.monitorFunction);
+    } else {
+      // SecureString parameters use the AWS managed key `alias/aws/ssm` unless
+      // another key is supplied. Its key ARN differs per account and alias ARNs
+      // are not valid IAM resources, so the statement is scoped to keys in this
+      // account and Region that are used through SSM and carry that alias.
+      this.monitorFunction.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: 'DecryptTelegramBotTokenParameter',
+          actions: ['kms:Decrypt'],
+          resources: [this.formatArn({ service: 'kms', resource: 'key', resourceName: '*' })],
+          conditions: {
+            StringEquals: { 'kms:ViaService': `ssm.${this.region}.amazonaws.com` },
+            'ForAnyValue:StringEquals': { 'kms:ResourceAliases': 'alias/aws/ssm' },
+          },
+        }),
+      );
+    }
+
     this.snapshotTable.grantReadWriteData(this.monitorFunction);
 
     new events.Rule(this, 'DailySummaryRule', {
@@ -144,6 +212,10 @@ export class CostAnomalyStack extends Stack {
     new CfnOutput(this, 'SnapshotTableName', {
       description: 'DynamoDB table holding one item per monitored day',
       value: this.snapshotTable.tableName,
+    });
+    new CfnOutput(this, 'TelegramBotTokenParameterName', {
+      description: 'SSM SecureString parameter that holds the Telegram bot token',
+      value: botTokenParamName,
     });
   }
 }
